@@ -71,8 +71,46 @@ use crate::{
     trace,
 };
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU64, Ordering};
 use cranelift_entity::{EntityRef, packed_option::PackedOption};
 use rustc_hash::{FxHashMap, FxHashSet};
+
+// v2.1 Path D Phase 1G.C — production fire counters for cross-block
+// DSE. Counter only; the Phase 1G.B strict-chain + deopt-safe rule is
+// unchanged. Bumped from `find_dead_store_at` on (a) every entry into
+// the cross-block branch (`CROSS_BLOCK_DSE_INVOCATIONS`), and (b) every
+// cross-block accept that yields a real `Some(prior_inst)` result
+// (`CROSS_BLOCK_DSE_ACCEPTS`). Read via
+// `cross_block_dse_fire_count()`; reset via
+// `reset_cross_block_dse_fire_count()`.
+static CROSS_BLOCK_DSE_INVOCATIONS: AtomicU64 = AtomicU64::new(0);
+static CROSS_BLOCK_DSE_ACCEPTS: AtomicU64 = AtomicU64::new(0);
+
+/// v2.1 Path D Phase 1G.C — read the cross-block DSE fire counters.
+///
+/// Returns `(invocations, accepts)`:
+/// - `invocations` is incremented every time `find_dead_store_at`
+///   enters the cross-block branch (i.e., `prior_block != current_block`
+///   and `prior_block` dominates `current_block`).
+/// - `accepts` is incremented every time the cross-block branch
+///   produces a `Some(prior_inst)` result (i.e., the strict-chain /
+///   deopt-safe check passed AND precondition (8) held).
+///
+/// Cumulative counts across all DSE invocations on the current
+/// process. Use [`reset_cross_block_dse_fire_count`] to zero them
+/// between workloads.
+pub fn cross_block_dse_fire_count() -> (u64, u64) {
+    (
+        CROSS_BLOCK_DSE_INVOCATIONS.load(Ordering::Relaxed),
+        CROSS_BLOCK_DSE_ACCEPTS.load(Ordering::Relaxed),
+    )
+}
+
+/// v2.1 Path D Phase 1G.C — reset the cross-block DSE fire counters.
+pub fn reset_cross_block_dse_fire_count() {
+    CROSS_BLOCK_DSE_INVOCATIONS.store(0, Ordering::Relaxed);
+    CROSS_BLOCK_DSE_ACCEPTS.store(0, Ordering::Relaxed);
+}
 
 /// For a given program point, the vector of last-store instruction
 /// indices for each disjoint category of abstract state.
@@ -559,6 +597,11 @@ impl<'a> AliasAnalysis<'a> {
             if !self.domtree.block_dominates(prior_block, current_block) {
                 return None;
             }
+            // Phase 1G.C — count every entry into the cross-block branch
+            // (only after the cheap dominance filter, so the counter
+            // reflects "we did the chain walk" not "we considered
+            // cross-block").
+            CROSS_BLOCK_DSE_INVOCATIONS.fetch_add(1, Ordering::Relaxed);
             self.cross_block_dominator_chain_check(
                 func,
                 prior_inst,
@@ -569,6 +612,14 @@ impl<'a> AliasAnalysis<'a> {
                 offset,
                 ty,
             )?;
+            // (8) dominance (cheap after (6))
+            if !self.domtree.dominates(prior_inst, current_inst, &func.layout) {
+                return None;
+            }
+            // Phase 1G.C — count every cross-block accept that yields a
+            // real Some(prior_inst).
+            CROSS_BLOCK_DSE_ACCEPTS.fetch_add(1, Ordering::Relaxed);
+            return Some(prior_inst);
         }
 
         // (8) dominance (cheap after (6))

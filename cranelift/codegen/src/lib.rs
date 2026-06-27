@@ -74,6 +74,7 @@ pub use crate::machinst::{
 };
 
 mod alias_analysis;
+pub use crate::alias_analysis::{cross_block_dse_fire_count, reset_cross_block_dse_fire_count};
 mod constant_hash;
 mod context;
 mod ctxhash;
