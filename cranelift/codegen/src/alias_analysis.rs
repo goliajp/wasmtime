@@ -565,6 +565,9 @@ impl<'a> AliasAnalysis<'a> {
                 prior_block,
                 current_inst,
                 current_block,
+                address,
+                offset,
+                ty,
             )?;
         }
 
@@ -616,6 +619,9 @@ impl<'a> AliasAnalysis<'a> {
         prior_block: Block,
         current_inst: Inst,
         current_block: Block,
+        address: Value,
+        offset: Offset32,
+        ty: Type,
     ) -> Option<()> {
         // Walk the idom chain from `current_block` upward, collecting
         // every block we pass through until we land on `prior_block`.
@@ -663,7 +669,9 @@ impl<'a> AliasAnalysis<'a> {
                         !is_current_block,
                         "current_block terminator must be past current_inst"
                     );
-                    if !self.successors_all_on_chain(func, block, &chain_set) {
+                    if !self.successors_chain_or_deopt_safe(
+                        func, block, &chain_set, address, offset, ty,
+                    ) {
                         return None;
                     }
                 }
@@ -681,21 +689,137 @@ impl<'a> AliasAnalysis<'a> {
         Some(())
     }
 
-    /// Phase 1G.B.2 helper — every CFG successor of `block`'s
-    /// terminator must be in `chain_set`. Returns `true` if so.
-    fn successors_all_on_chain(
+    /// Phase 1G.B.3 — every CFG successor of `block`'s terminator must
+    /// either be on the chain (strict-chain accept) OR qualify as a
+    /// "deopt-safe" off-chain side exit (see
+    /// `is_deopt_safe_side_exit`).
+    ///
+    /// The deopt-safe relaxation matches luna-jit's per-side-exit
+    /// `emit_store_back_and_return_pc` shape (see Phase 1G.A audit
+    /// §4.5): a side-exit block that writes the live Variable value
+    /// back to the same `(address, offset)` via a plain (non-notrap)
+    /// Store BEFORE any load of that slot and BEFORE branching
+    /// onward. Such a side exit overwrites the prior store's effect
+    /// before any external observer (interpreter resume, trap handler,
+    /// etc.) can read the stale value.
+    fn successors_chain_or_deopt_safe(
         &self,
         func: &Function,
         block: Block,
         chain_set: &FxHashSet<Block>,
+        address: Value,
+        offset: Offset32,
+        ty: Type,
     ) -> bool {
-        let mut all_on_chain = true;
+        let mut all_safe = true;
         visit_block_succs(func, block, |_branch, succ, _from_table| {
-            if !chain_set.contains(&succ) {
-                all_on_chain = false;
+            if chain_set.contains(&succ) {
+                return;
+            }
+            if !self.is_deopt_safe_side_exit(func, succ, address, offset, ty) {
+                all_safe = false;
             }
         });
-        all_on_chain
+        all_safe
+    }
+
+    /// Phase 1G.B.3 helper — does `side_exit_block` qualify as a
+    /// "deopt-safe" side exit for the (address, offset, ty) MemoryLoc?
+    ///
+    /// Walks insts in `side_exit_block` from its head forward and
+    /// classifies the FIRST relevant event:
+    ///   - A load to (address, offset, ty) with any MemFlags → REJECT
+    ///     (the side exit observes the prior store's memory value
+    ///     before any overwrite).
+    ///   - A plain-Store (no extending variant) to (address, offset)
+    ///     with `MemFlags::notrap() == false` → ACCEPT (the side exit
+    ///     overwrites the prior store's effect before any external
+    ///     observer; matches luna-jit's
+    ///     `emit_store_back_and_return_pc` semantics — `MemFlags::new()`
+    ///     has notrap=false, can_trap=true, so trap-on-write is the
+    ///     deopt path's intended ordering guarantee).
+    ///   - Any branch / terminator before either of the above → REJECT
+    ///     (the side exit transfers control to a further block without
+    ///     overwriting the slot in its own body, so we'd have to
+    ///     transitively analyse successors — out of scope for Phase
+    ///     1G.B).
+    ///   - Any other inst (pure ALU, non-aliasing memory traffic,
+    ///     etc.) → CONTINUE walking.
+    ///
+    /// Returns `false` if we ran off the end without either an
+    /// overwrite or a disqualifying event (shouldn't normally happen —
+    /// a well-formed CLIF block ends in a terminator, which the walk
+    /// hits as a branch/terminator).
+    fn is_deopt_safe_side_exit(
+        &self,
+        func: &Function,
+        side_exit_block: Block,
+        address: Value,
+        offset: Offset32,
+        ty: Type,
+    ) -> bool {
+        let Some(start) = func.layout.first_inst(side_exit_block) else {
+            return false;
+        };
+        let mut walk = Some(start);
+        while let Some(inst) = walk {
+            let opcode = func.dfg.insts[inst].opcode();
+
+            // A load to the SAME MemoryLoc observes the prior store's
+            // value — must reject. We check (address, offset, ty)
+            // strictly; loads to other slots or with different types
+            // are non-aliasing for our purposes.
+            if opcode.can_load() {
+                if let Some((load_addr, load_off, load_ty)) =
+                    inst_addr_offset_type(func, inst)
+                {
+                    let load_addr = func.dfg.resolve_aliases(load_addr);
+                    if load_addr == address
+                        && load_off == offset
+                        && load_ty == ty
+                    {
+                        return false;
+                    }
+                }
+            }
+
+            // A plain-Store to (address, offset) with `!notrap` =
+            // deopt-safe overwrite. Type doesn't have to match
+            // strictly: any same-bytewidth overwrite at the same byte
+            // address replaces the slot's externally visible state.
+            // For conservatism we still require the same (address,
+            // offset) — different offsets touch different bytes.
+            if opcode.can_store() && get_ext_opcode(opcode).is_none() {
+                if let Some((store_addr, store_off, _store_ty)) =
+                    inst_addr_offset_type(func, inst)
+                {
+                    let store_addr = func.dfg.resolve_aliases(store_addr);
+                    if store_addr == address && store_off == offset {
+                        if let Some(flags) = func.dfg.insts[inst].memflags() {
+                            if !flags.notrap() {
+                                return true;
+                            }
+                            // A notrap store at the same loc that
+                            // PRECEDES any overwrite would itself be a
+                            // candidate for DSE, but we don't try to
+                            // chain into nested DSE here — be
+                            // conservative and continue walking.
+                        }
+                    }
+                }
+            }
+
+            // Hitting any branch / terminator before the overwrite
+            // means the side exit transfers control elsewhere without
+            // overwriting in its OWN body. Phase 1G.B does not analyse
+            // transitive side-exit successors — reject.
+            if opcode.is_branch() || opcode.is_terminator() {
+                return false;
+            }
+
+            walk = func.layout.next_inst(inst);
+        }
+        false
     }
 
     /// Drop the `mem_values` entry that `store_inst` inserted for itself.
