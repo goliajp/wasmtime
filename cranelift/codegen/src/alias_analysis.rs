@@ -70,6 +70,7 @@ use crate::{
     ir::{AliasRegion, Block, Function, Inst, Opcode, Type, Value, immediates::Offset32},
     trace,
 };
+use alloc::vec::Vec;
 use cranelift_entity::{EntityRef, packed_option::PackedOption};
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -446,15 +447,27 @@ impl<'a> AliasAnalysis<'a> {
     ///   5. The `mem_values` entry's `observed` bit is `false`: no
     ///      intervening load has must-aliased to the prior store's
     ///      value.
-    ///   6. `prior_inst` and `current_inst` are in the same basic
-    ///      block (Phase 1C scope discipline — avoids unsafe DSE across
-    ///      CFG joins where a sibling path may not overwrite).
+    ///   6. Block-scope discipline (Phase 1C / Phase 1G):
+    ///        - Phase 1C (same-block): `prior_inst` and `current_inst`
+    ///          live in the same basic block. Precondition (7) below
+    ///          walks the layout forward to verify no `can_trap` insts
+    ///          intervene.
+    ///        - Phase 1G (cross-block, strict-chain — added 2026-06-27):
+    ///          `prior_block` `block_dominates` `current_block`, and the
+    ///          immediate-dominator chain from `current_block` up to
+    ///          `prior_block` is BOTH (a) can_trap-clean across all
+    ///          insts on the chain, AND (b) every chain block's
+    ///          terminator's successors are themselves on the chain
+    ///          (no off-chain branch could observe the prior store's
+    ///          value before the current store overwrites it).
+    ///          See `cross_block_dominator_chain_check` below.
     ///   7. No instruction between `prior_inst` (exclusive) and
     ///      `current_inst` (exclusive) in the layout `can_trap()`. The
     ///      upstream TODO at `alias_analysis.rs:53-62` explicitly calls
     ///      out post-trap-termination memory state observability as
     ///      the safety boundary; we exclude any trapping inst between
-    ///      the two stores.
+    ///      the two stores. Phase 1G subsumes precondition (7) into
+    ///      the cross-block chain walk.
     ///   8. `prior_inst` dominates `current_inst` (cheap belt-and-
     ///      suspenders given precondition 6).
     pub fn find_dead_store_at(
@@ -512,28 +525,47 @@ impl<'a> AliasAnalysis<'a> {
             return None;
         }
 
-        // (6) same-block restriction (Phase 1C scope)
+        // (6 + 7) block-scope check fused with can_trap walk.
+        //
+        // Same-block (Phase 1C path) keeps the original layout-order
+        // forward walk. Cross-block (Phase 1G strict-chain path) walks
+        // the dominator chain from `current_block` up to `prior_block`,
+        // verifying can_trap-clean insts and that every chain block's
+        // terminator branches only into the chain.
         let prior_block = func.layout.inst_block(prior_inst)?;
         let current_block = func.layout.inst_block(current_inst)?;
-        if prior_block != current_block {
-            return None;
-        }
-
-        // (7) no intervening can_trap inst
-        let mut walk = func.layout.next_inst(prior_inst);
-        while let Some(inst) = walk {
-            if inst == current_inst {
-                break;
+        if prior_block == current_block {
+            // Phase 1C — same-block forward walk.
+            let mut walk = func.layout.next_inst(prior_inst);
+            while let Some(inst) = walk {
+                if inst == current_inst {
+                    break;
+                }
+                if func.dfg.insts[inst].opcode().can_trap() {
+                    return None;
+                }
+                walk = func.layout.next_inst(inst);
             }
-            if func.dfg.insts[inst].opcode().can_trap() {
+            // If we didn't reach current_inst by walking forward from
+            // prior, prior is NOT before current in this block — reject.
+            if walk.is_none() {
                 return None;
             }
-            walk = func.layout.next_inst(inst);
-        }
-        // If we didn't reach current_inst by walking forward from prior,
-        // prior is NOT before current in this block — reject.
-        if walk.is_none() {
-            return None;
+        } else {
+            // Phase 1G strict-chain (1G.B.2) — cross-block.
+            //
+            // Cheap O(1) block-dominance test first; the idom-chain walk
+            // also catches non-domination but bails late.
+            if !self.domtree.block_dominates(prior_block, current_block) {
+                return None;
+            }
+            self.cross_block_dominator_chain_check(
+                func,
+                prior_inst,
+                prior_block,
+                current_inst,
+                current_block,
+            )?;
         }
 
         // (8) dominance (cheap after (6))
@@ -542,6 +574,128 @@ impl<'a> AliasAnalysis<'a> {
         }
 
         Some(prior_inst)
+    }
+
+    /// Phase 1G.B.2 (strict-chain) — cross-block DSE safety check.
+    ///
+    /// Walks the immediate-dominator chain from `current_block` up to
+    /// `prior_block`. Returns `Some(())` if BOTH:
+    ///
+    ///   (a) Every instruction on the chain (in `prior_block` after
+    ///       `prior_inst`, in any intermediate block, and in
+    ///       `current_block` up to but not including `current_inst`) is
+    ///       `!can_trap()`. A trapping inst between the two stores
+    ///       would create a program point at which the prior store's
+    ///       memory value is externally observable, defeating DSE.
+    ///
+    ///   (b) For every chain block whose terminator we cross (i.e.,
+    ///       every chain block except `current_block`), all of that
+    ///       terminator's CFG successors are themselves on the chain.
+    ///       An off-chain branch successor would be a side-exit block
+    ///       reachable BEFORE `current_inst` overwrites the slot —
+    ///       that side-exit could observe the prior store's memory
+    ///       value, which DSE must forbid.
+    ///
+    /// Returns `None` (rejecting DSE) on any of:
+    ///   - prior_block is unreachable from current_block via idom chain
+    ///     (this is also implied by precondition `block_dominates`,
+    ///     but the walk handles it defensively).
+    ///   - any chain inst is can_trap.
+    ///   - any chain block branches off-chain (the Phase 1G.B.3
+    ///     deopt-safe relaxation lifts this case under restricted
+    ///     conditions; see `successors_chain_or_deopt_safe`).
+    ///
+    /// Safety burden: this method is the entire correctness gate for
+    /// cross-block DSE. The cranelift verifier does NOT enforce alias
+    /// analysis correctness (see Phase 1G.A audit §3); a bug here would
+    /// silently drop a memory write that an external observer can see.
+    fn cross_block_dominator_chain_check(
+        &self,
+        func: &Function,
+        prior_inst: Inst,
+        prior_block: Block,
+        current_inst: Inst,
+        current_block: Block,
+    ) -> Option<()> {
+        // Walk the idom chain from `current_block` upward, collecting
+        // every block we pass through until we land on `prior_block`.
+        //
+        // chain[0] = current_block, chain[N-1] = prior_block.
+        let mut chain: Vec<Block> = Vec::new();
+        chain.push(current_block);
+        let mut cur = current_block;
+        while cur != prior_block {
+            cur = self.domtree.idom(cur)?;
+            chain.push(cur);
+        }
+        let chain_set: FxHashSet<Block> = chain.iter().copied().collect();
+
+        // Iterate prior → ... → current (CFG execution order).
+        for &block in chain.iter().rev() {
+            let is_prior_block = block == prior_block;
+            let is_current_block = block == current_block;
+
+            // Start past `prior_inst` in the first chain block, at
+            // the block head otherwise.
+            let start = if is_prior_block {
+                // prior_inst is a non-terminator store, so next_inst is
+                // always Some (worst case the block's terminator).
+                func.layout.next_inst(prior_inst)?
+            } else {
+                func.layout.first_inst(block)?
+            };
+
+            let mut walk = Some(start);
+            while let Some(inst) = walk {
+                // Stop at current_inst in the final chain block.
+                if is_current_block && inst == current_inst {
+                    break;
+                }
+                let opcode = func.dfg.insts[inst].opcode();
+                if opcode.can_trap() {
+                    return None;
+                }
+                // Terminator handling. We only encounter terminators on
+                // chain blocks BEFORE current_block — current_block's
+                // terminator is past current_inst and we break above.
+                if opcode.is_branch() {
+                    debug_assert!(
+                        !is_current_block,
+                        "current_block terminator must be past current_inst"
+                    );
+                    if !self.successors_all_on_chain(func, block, &chain_set) {
+                        return None;
+                    }
+                }
+                walk = func.layout.next_inst(inst);
+            }
+
+            // If we hit the end of current_block without seeing
+            // current_inst, layout order doesn't agree with dominance
+            // — bail.
+            if is_current_block && walk.is_none() {
+                return None;
+            }
+        }
+
+        Some(())
+    }
+
+    /// Phase 1G.B.2 helper — every CFG successor of `block`'s
+    /// terminator must be in `chain_set`. Returns `true` if so.
+    fn successors_all_on_chain(
+        &self,
+        func: &Function,
+        block: Block,
+        chain_set: &FxHashSet<Block>,
+    ) -> bool {
+        let mut all_on_chain = true;
+        visit_block_succs(func, block, |_branch, succ, _from_table| {
+            if !chain_set.contains(&succ) {
+                all_on_chain = false;
+            }
+        });
+        all_on_chain
     }
 
     /// Drop the `mem_values` entry that `store_inst` inserted for itself.
