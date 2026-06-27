@@ -1,0 +1,53 @@
+test optimize
+set opt_level=speed
+target x86_64
+
+;; luna v2.1 Path D Phase 1G.B.4 — cross-block deopt-safe relaxation
+;; filetest.
+;;
+;; Phase 1G.B.3 added `is_deopt_safe_side_exit`: when a chain block's
+;; terminator has an off-chain branch successor (i.e., a side-exit
+;; block), the cross-block DSE check accepts the off-chain successor
+;; IF that side-exit block contains a plain (non-notrap) Store to
+;; (address, offset) BEFORE any load of the same MemoryLoc and
+;; BEFORE branching onward. The plain store models luna-jit's
+;; `emit_store_back_and_return_pc` shape: write the Variable's live
+;; value back to memory so the deopt observer sees the new value, not
+;; the stale prior store.
+
+;;----------------------------------------------------------------------
+;; Positive — brif with one chain successor (block1=continue) and one
+;; off-chain side exit (block2=deopt). block2 contains a plain
+;; (non-notrap) Store to addr+0 then returns. The prior store in
+;; block0 must be removed.
+;;----------------------------------------------------------------------
+
+function %dse_cross_block_deopt_safe(i64, i64, i32) -> i64 {
+block0(v0: i64, v1: i64, v2: i32):
+    v3 = iconst.i64 999
+    store notrap aligned v3, v0          ;; PRIOR (dead; deopt-safe side exit)
+    brif v2, block1, block2
+
+block1:                                   ;; continue path (on dom chain)
+    v4 = iconst.i64 6
+    v5 = imul v1, v4
+    store notrap aligned v5, v0          ;; CURRENT (kept)
+    return v5
+
+block2:                                   ;; deopt path (off chain)
+    v6 = iconst.i64 42
+    store v6, v0                          ;; plain Store (notrap=false)
+                                          ;; — deopt-safe overwrite
+    return v6
+}
+
+;; The prior store + its constant must vanish; block1's current store
+;; survives; block2's deopt-safe overwrite survives unchanged.
+; check:  block0(v0: i64, v1: i64, v2: i32):
+; not:    store notrap aligned v3, v0
+; not:    iconst.i64 999
+; check:  brif v2, block1, block2
+; check:  block1:
+; check:  store notrap aligned v5, v0
+; check:  block2:
+; check:  store v6, v0

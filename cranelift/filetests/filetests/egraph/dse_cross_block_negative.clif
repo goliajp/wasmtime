@@ -1,0 +1,65 @@
+test optimize
+set opt_level=speed
+target x86_64
+
+;; luna v2.1 Path D Phase 1G.B.4 — cross-block DSE negative filetests.
+;;
+;; The Phase 1G.B cross-block extension MUST NOT fire in any of the
+;; shapes below. Each shape exercises a different rejection axis of
+;; `cross_block_dominator_chain_check` / `is_deopt_safe_side_exit`.
+
+;;----------------------------------------------------------------------
+;; Negative 1 — off-chain side exit reads via trusted load before
+;; overwriting. The load against (addr+0) would observe the prior
+;; store's memory value -> reject.
+;;----------------------------------------------------------------------
+
+function %dse_cross_block_neg_side_exit_loads(i64, i64, i32) -> i64 {
+block0(v0: i64, v1: i64, v2: i32):
+    v3 = iconst.i64 999
+    store notrap aligned v3, v0          ;; PRIOR (kept — side exit loads)
+    brif v2, block1, block2
+
+block1:
+    v4 = iconst.i64 6
+    v5 = imul v1, v4
+    store notrap aligned v5, v0          ;; CURRENT (kept)
+    return v5
+
+block2:
+    ;; Side exit reads the slot before overwriting — observes prior.
+    v6 = load.i64 notrap aligned v0
+    v7 = iadd_imm v6, 1
+    store v7, v0
+    return v6
+}
+
+; check:  block0(v0: i64, v1: i64, v2: i32):
+; check:  store notrap aligned v3, v0
+; check:  store notrap aligned v5, v0
+
+;;----------------------------------------------------------------------
+;; Negative 2 — off-chain side exit returns without any overwrite.
+;; No qualifying plain Store -> reject.
+;;----------------------------------------------------------------------
+
+function %dse_cross_block_neg_side_exit_no_overwrite(i64, i64, i32) -> i64 {
+block0(v0: i64, v1: i64, v2: i32):
+    v3 = iconst.i64 999
+    store notrap aligned v3, v0          ;; PRIOR (kept — no overwrite on side exit)
+    brif v2, block1, block2
+
+block1:
+    v4 = iconst.i64 6
+    v5 = imul v1, v4
+    store notrap aligned v5, v0          ;; CURRENT (kept)
+    return v5
+
+block2:
+    v6 = iconst.i64 7
+    return v6                            ;; no overwrite store -> reject
+}
+
+; check:  block0(v0: i64, v1: i64, v2: i32):
+; check:  store notrap aligned v3, v0
+; check:  store notrap aligned v5, v0

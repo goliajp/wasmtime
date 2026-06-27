@@ -1,0 +1,69 @@
+test optimize
+set opt_level=speed
+target x86_64
+
+;; luna v2.1 Path D Phase 1G.B.4 — cross-block strict-chain DSE filetest.
+;;
+;; Phase 1G.B.2 extended `find_dead_store_at` (alias_analysis.rs) so
+;; precondition (6) accepts prior/current in DIFFERENT blocks when:
+;;   - prior_block block_dominates current_block;
+;;   - the idom chain (current_block → ... → prior_block) is
+;;     can_trap-clean;
+;;   - every chain block's terminator branches only into the chain
+;;     (no off-chain side-exit could observe the prior store).
+;;
+;; This filetest exercises the strict-chain ACCEPT path: two blocks
+;; in a linear fall-through chain, no can_trap, no side exits. The
+;; prior store in block0 must be removed; the current store in block1
+;; must survive.
+
+;;----------------------------------------------------------------------
+;; Positive — linear two-block strict chain. Prior store dead.
+;;----------------------------------------------------------------------
+
+function %dse_cross_block_strict_linear(i64, i64) -> i64 {
+block0(v0: i64, v1: i64):
+    v2 = iconst.i64 999
+    store notrap aligned v2, v0          ;; PRIOR (dead, in block0)
+    v3 = iconst.i64 6
+    v4 = imul v1, v3                     ;; pure arithmetic
+    jump block1
+
+block1:
+    v5 = iconst.i64 4
+    v6 = iadd v4, v5                     ;; more pure arithmetic
+    store notrap aligned v6, v0          ;; CURRENT (kept, in block1)
+    return v6
+}
+
+; check:  block0(v0: i64, v1: i64):
+; not:    store notrap aligned v2, v0
+; not:    iconst.i64 999
+; check:  store notrap aligned v6, v0
+; check:  return v6
+
+;;----------------------------------------------------------------------
+;; Negative — chain with an intervening can_trap inst (udiv).
+;;
+;; The chain walk in `cross_block_dominator_chain_check` rejects any
+;; can_trap inst between prior_inst and current_inst. Both stores
+;; must survive.
+;;----------------------------------------------------------------------
+
+function %dse_cross_block_strict_can_trap_blocks(i64, i64, i64) -> i64 {
+block0(v0: i64, v1: i64, v2: i64):
+    v3 = iconst.i64 999
+    store notrap aligned v3, v0          ;; PRIOR (kept — chain has udiv)
+    jump block1
+
+block1:
+    v4 = udiv v1, v2                     ;; can_trap (runtime divisor) — rejects DSE
+    store notrap aligned v4, v0          ;; CURRENT (kept)
+    return v4
+}
+
+; check:  block0(v0: i64, v1: i64, v2: i64):
+; check:  store notrap aligned v3, v0
+; check:  v4 = udiv.i64 v1, v2
+; check:  store notrap aligned v4, v0
+; check:  return v4
