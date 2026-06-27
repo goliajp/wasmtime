@@ -366,4 +366,24 @@ impl<'a, 'b, 'c> generated_code::Context for IsleContext<'a, 'b, 'c> {
             shift_by: shift_by.try_into().unwrap(),
         }
     }
+
+    // ---------------------------------------------------------------------
+    // Phase 1C — redundant-store DCE (luna v2.1 Path D)
+    //
+    // ISLE-side helpers consumed by `opts/skeleton.isle`'s DSE rule. See
+    // `alias_analysis.rs` (`AliasAnalysis::find_dead_store_at`) for the
+    // analysis-side query.
+    // ---------------------------------------------------------------------
+
+    fn mem_flags_notrap(&mut self, flags: MemFlags) -> bool {
+        flags.notrap()
+    }
+
+    fn prior_dead_store_at_same_loc(&mut self, current_inst: Inst) -> Option<Inst> {
+        let func: &crate::ir::Function = self.ctx.func;
+        let state: &crate::alias_analysis::LastStores = self.ctx.alias_analysis_state;
+        self.ctx
+            .alias_analysis
+            .find_dead_store_at(func, state, current_inst)
+    }
 }

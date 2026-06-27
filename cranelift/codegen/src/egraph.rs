@@ -430,6 +430,32 @@ where
         // instructions.
         if let Some(cmd) = self.simplify_skeleton_inst(inst) {
             self.stats.skeleton_inst_simplified += 1;
+
+            // Phase 1C: a `RemoveOther { inst: prior }` simplification means
+            // the CURRENT instruction is preserved and a PRIOR instruction
+            // must be erased instead. The current store still needs to flow
+            // through alias-analysis state-update so subsequent loads can
+            // must-alias-forward through it. We also drop the dying inst's
+            // `mem_values` self-entry so future `domtree.dominates()`
+            // queries don't trip on a removed inst.
+            if let SkeletonInstSimplification::RemoveOther { inst: prior } = cmd {
+                self.stats.skeleton_inst_dse += 1;
+                self.alias_analysis
+                    .invalidate_mem_value_for_store(self.func, prior);
+                let _ = self.alias_analysis.process_inst(
+                    self.func,
+                    self.alias_analysis_state,
+                    inst,
+                );
+                // Identity-map the current store's results (it has none for
+                // plain stores, but the loop is harmless).
+                for &result in self.func.dfg.inst_results(inst) {
+                    self.value_to_opt_value[result] = result;
+                    self.available_block[result] = block;
+                }
+                return Some(cmd);
+            }
+
             return Some(cmd);
         }
 
@@ -627,6 +653,15 @@ where
                             ctx.func.dfg.value_type(val),
                         );
                     }
+                    return Some(simplification);
+                }
+                // Phase 1C (luna v2.1 Path D): greedy short-circuit for DSE.
+                // RemoveOther keeps the current inst and erases a PRIOR
+                // instruction; we always want to fire the rule (cost on the
+                // current inst is unchanged).
+                SkeletonInstSimplification::RemoveOther { inst: prior } => {
+                    log::trace!(" -> simplify_skeleton: remove other (prior) inst {prior}");
+                    debug_assert_ne!(prior, inst);
                     return Some(simplification);
                 }
 
@@ -958,6 +993,20 @@ impl<'a> EgraphPass<'a> {
                 forward_val(cursor, old_val, val);
                 return;
             }
+            // Phase 1C (luna v2.1 Path D): the current inst is preserved
+            // and a different (prior) inst is removed from the layout.
+            // `Layout::remove_inst` does not touch the cursor, so the
+            // outer egraph block walk's next `next_inst()` will advance
+            // past the current inst as if no simplification had fired.
+            //
+            // The `mem_values` self-entry for `prior` was already cleared
+            // in `optimize_skeleton_inst` (the egraph caller) so any later
+            // `domtree.dominates(prior, ...)` cannot panic.
+            SkeletonInstSimplification::RemoveOther { inst: prior } => {
+                debug_assert_ne!(prior, old_inst);
+                cursor.func.layout.remove_inst(prior);
+                return;
+            }
             SkeletonInstSimplification::Replace { inst } => (inst, None),
             SkeletonInstSimplification::ReplaceWithVal { inst, val } => (inst, Some(val)),
         };
@@ -1092,6 +1141,10 @@ pub(crate) struct Stats {
     pub(crate) skeleton_inst: u64,
     pub(crate) skeleton_inst_simplified: u64,
     pub(crate) skeleton_inst_gvn: u64,
+    /// Phase 1C — luna v2.1 Path D: count of redundant-store DCE
+    /// firings (a prior store erased because a subsequent store to the
+    /// same loc dominates it with no intervening reads/traps).
+    pub(crate) skeleton_inst_dse: u64,
     pub(crate) alias_analysis_removed: u64,
     pub(crate) new_inst: u64,
     pub(crate) union: u64,

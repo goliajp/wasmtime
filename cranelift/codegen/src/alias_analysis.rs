@@ -143,6 +143,26 @@ impl LastStores {
     }
 }
 
+// LastStores is exposed publicly so the egraph mid-end can pass it through
+// the ISLE context to `AliasAnalysis::find_dead_store_at`.
+
+/// Per-`MemoryLoc` value entry. Tracks both the defining instruction and
+/// whether a subsequent load has must-aliased to it (consuming its value).
+/// The `observed` bit was added in Phase 1C to support redundant-store DCE.
+#[derive(Clone, Copy, Debug)]
+struct MemoryValueEntry {
+    /// The instruction that defined this memory-value (a store, or a load
+    /// whose result we recorded as the equivalent value at this location).
+    def_inst: Inst,
+    /// The SSA value present at this memory location.
+    value: Value,
+    /// `true` once any load has must-aliased to this entry and forwarded
+    /// its value. Stays `false` if only stores have written here without
+    /// any consumer reading the location. Used by DSE to verify that the
+    /// prior store's value has never been observed before we delete it.
+    observed: bool,
+}
+
 /// A key identifying a unique memory location.
 ///
 /// For the result of a load to be equivalent to the result of another
@@ -185,8 +205,11 @@ pub struct AliasAnalysis<'a> {
     /// analysis. This is a mapping from (last store, address
     /// expression, offset, type) to SSA `Value`.
     ///
-    /// We keep the defining inst around for quick dominance checks.
-    mem_values: FxHashMap<MemoryLoc, (Inst, Value)>,
+    /// We keep the defining inst around for quick dominance checks, and
+    /// an `observed` bit (Phase 1C) that flips to `true` the first time
+    /// a must-aliased load consumes the entry's value. DSE uses this to
+    /// know whether the prior store's value has been read.
+    mem_values: FxHashMap<MemoryLoc, MemoryValueEntry>,
 }
 
 impl<'a> AliasAnalysis<'a> {
@@ -296,7 +319,14 @@ impl<'a> AliasAnalysis<'a> {
                     store_data.index(),
                     mem_loc
                 );
-                self.mem_values.insert(mem_loc, (inst, store_data));
+                self.mem_values.insert(
+                    mem_loc,
+                    MemoryValueEntry {
+                        def_inst: inst,
+                        value: store_data,
+                        observed: false,
+                    },
+                );
 
                 None
             } else if opcode.can_load() {
@@ -326,26 +356,35 @@ impl<'a> AliasAnalysis<'a> {
                 // load (stores will always dominate though if
                 // their `last_store` survives through
                 // meet-points to this use-site).
-                let aliased =
-                    if let Some((def_inst, value)) = self.mem_values.get(&mem_loc).cloned() {
+                let aliased = if let Some(entry) = self.mem_values.get(&mem_loc).cloned() {
+                    let MemoryValueEntry {
+                        def_inst, value, ..
+                    } = entry;
+                    trace!(
+                        " -> sees known value v{} from inst{}",
+                        value.index(),
+                        def_inst.index()
+                    );
+                    if self.domtree.dominates(def_inst, inst, &func.layout) {
                         trace!(
-                            " -> sees known value v{} from inst{}",
-                            value.index(),
-                            def_inst.index()
+                            " -> dominates; value equiv from v{} to v{} inserted",
+                            load_result.index(),
+                            value.index()
                         );
-                        if self.domtree.dominates(def_inst, inst, &func.layout) {
-                            trace!(
-                                " -> dominates; value equiv from v{} to v{} inserted",
-                                load_result.index(),
-                                value.index()
-                            );
-                            Some(value)
-                        } else {
-                            None
+                        // Phase 1C: mark the entry as observed by a load.
+                        // This forwarding consumes the entry's value, so any
+                        // subsequent DSE attempt against this `def_inst` must
+                        // be rejected.
+                        if let Some(e) = self.mem_values.get_mut(&mem_loc) {
+                            e.observed = true;
                         }
+                        Some(value)
                     } else {
                         None
-                    };
+                    }
+                } else {
+                    None
+                };
 
                 // Otherwise, we can keep *this* load around
                 // as a new equivalent value.
@@ -355,7 +394,18 @@ impl<'a> AliasAnalysis<'a> {
                         load_result.index(),
                         mem_loc
                     );
-                    self.mem_values.insert(mem_loc, (inst, load_result));
+                    self.mem_values.insert(
+                        mem_loc,
+                        MemoryValueEntry {
+                            def_inst: inst,
+                            value: load_result,
+                            // A miss-aliased load inserts itself as the
+                            // equivalent value at this location, but no
+                            // store's value has yet been observed via
+                            // this entry — leave `observed = false`.
+                            observed: false,
+                        },
+                    );
                 }
 
                 aliased
@@ -369,6 +419,152 @@ impl<'a> AliasAnalysis<'a> {
         state.update(func, inst);
 
         replacing_value
+    }
+
+    /// Phase 1C — redundant-store DCE query (luna v2.1 Path D).
+    ///
+    /// Given the egraph driver's current store instruction `current_inst`
+    /// and the alias-analysis `state` at this program point (BEFORE the
+    /// driver has called `process_inst` for `current_inst`), return the
+    /// `Inst` handle of a PRIOR store at the same memory location that
+    /// is now provably dead — meaning the egraph driver may safely
+    /// remove it from the layout. Returns `None` if no such prior store
+    /// exists or any safety precondition is unmet.
+    ///
+    /// Preconditions enforced here (in addition to the ISLE rule's
+    /// notrap check on the CURRENT store):
+    ///
+    ///   1. Current store has plain-`Store` opcode (no extending variant).
+    ///   2. `state.get_last_store` for the current store's alias region
+    ///      points at some `prior_inst`.
+    ///   3. `prior_inst` is itself a plain-`Store` opcode with notrap
+    ///      MemFlags.
+    ///   4. `prior_inst` and `current_inst` share the same `(address,
+    ///      offset, ty)` MemoryLoc key — i.e., there is a
+    ///      `mem_values` entry keyed under `last_store = prior_inst`
+    ///      with `def_inst = prior_inst`.
+    ///   5. The `mem_values` entry's `observed` bit is `false`: no
+    ///      intervening load has must-aliased to the prior store's
+    ///      value.
+    ///   6. `prior_inst` and `current_inst` are in the same basic
+    ///      block (Phase 1C scope discipline — avoids unsafe DSE across
+    ///      CFG joins where a sibling path may not overwrite).
+    ///   7. No instruction between `prior_inst` (exclusive) and
+    ///      `current_inst` (exclusive) in the layout `can_trap()`. The
+    ///      upstream TODO at `alias_analysis.rs:53-62` explicitly calls
+    ///      out post-trap-termination memory state observability as
+    ///      the safety boundary; we exclude any trapping inst between
+    ///      the two stores.
+    ///   8. `prior_inst` dominates `current_inst` (cheap belt-and-
+    ///      suspenders given precondition 6).
+    pub fn find_dead_store_at(
+        &self,
+        func: &Function,
+        state: &LastStores,
+        current_inst: Inst,
+    ) -> Option<Inst> {
+        // (1) current must be a plain store (not an extending variant)
+        let current_opcode = func.dfg.insts[current_inst].opcode();
+        if !current_opcode.can_store() {
+            return None;
+        }
+        if get_ext_opcode(current_opcode).is_some() {
+            return None;
+        }
+        let (address, offset, ty) = inst_addr_offset_type(func, current_inst)?;
+        let address = func.dfg.resolve_aliases(address);
+
+        // (2) prior_inst = last store for current's region
+        let prior_inst = state.get_last_store(func, current_inst).expand()?;
+        if prior_inst == current_inst {
+            return None;
+        }
+
+        // (3) prior must be a plain notrap store
+        let prior_opcode = func.dfg.insts[prior_inst].opcode();
+        if !prior_opcode.can_store() {
+            return None;
+        }
+        if get_ext_opcode(prior_opcode).is_some() {
+            return None;
+        }
+        let prior_flags = func.dfg.insts[prior_inst].memflags()?;
+        if !prior_flags.notrap() {
+            return None;
+        }
+
+        // (4) mem_values entry must exist under (last_store=prior_inst,
+        //     address, offset, ty) and have def_inst == prior_inst.
+        let key = MemoryLoc {
+            last_store: prior_inst.into(),
+            address,
+            offset,
+            ty,
+            extending_opcode: None,
+        };
+        let entry = self.mem_values.get(&key)?;
+        if entry.def_inst != prior_inst {
+            return None;
+        }
+
+        // (5) no intervening load may have read the prior store's value
+        if entry.observed {
+            return None;
+        }
+
+        // (6) same-block restriction (Phase 1C scope)
+        let prior_block = func.layout.inst_block(prior_inst)?;
+        let current_block = func.layout.inst_block(current_inst)?;
+        if prior_block != current_block {
+            return None;
+        }
+
+        // (7) no intervening can_trap inst
+        let mut walk = func.layout.next_inst(prior_inst);
+        while let Some(inst) = walk {
+            if inst == current_inst {
+                break;
+            }
+            if func.dfg.insts[inst].opcode().can_trap() {
+                return None;
+            }
+            walk = func.layout.next_inst(inst);
+        }
+        // If we didn't reach current_inst by walking forward from prior,
+        // prior is NOT before current in this block — reject.
+        if walk.is_none() {
+            return None;
+        }
+
+        // (8) dominance (cheap after (6))
+        if !self.domtree.dominates(prior_inst, current_inst, &func.layout) {
+            return None;
+        }
+
+        Some(prior_inst)
+    }
+
+    /// Drop the `mem_values` entry that `store_inst` inserted for itself.
+    /// Called by the egraph driver right before a DSE-RemoveOther erases
+    /// `store_inst` from the layout, so later `dominates(store_inst,
+    /// load_inst, layout)` queries do not panic on a removed inst.
+    ///
+    /// Only the single entry where `def_inst == store_inst` is removed;
+    /// other entries keyed with `last_store = store_inst` (inserted by
+    /// later miss-aliased loads) keep their own def_insts and stay valid
+    /// since those def_insts are loads still present in the layout.
+    pub fn invalidate_mem_value_for_store(&mut self, func: &Function, store_inst: Inst) {
+        if let Some((address, offset, ty)) = inst_addr_offset_type(func, store_inst) {
+            let address = func.dfg.resolve_aliases(address);
+            let key = MemoryLoc {
+                last_store: store_inst.into(),
+                address,
+                offset,
+                ty,
+                extending_opcode: None,
+            };
+            self.mem_values.remove(&key);
+        }
     }
 
     /// Make a pass and update known-redundant loads to aliased

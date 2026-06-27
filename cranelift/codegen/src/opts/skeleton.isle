@@ -44,3 +44,29 @@
                          (iconst ty (imm64_power_of_two n))
                          (iconst ty (imm64_power_of_two m)))))
   (ushr ty y (select ty x (iconst ty (imm64 n)) (iconst ty (imm64 m)))))
+
+;; Redundant-store DCE (luna v2.1 Path D Phase 1C).
+;;
+;; If the current store has notrap MemFlags AND there exists a prior store
+;; to the same memory location, in the same block, with no intervening
+;; load that has observed the prior store's value AND no intervening
+;; potentially-trapping instruction AND the prior store also has notrap
+;; MemFlags, eliminate the prior store. The current store's effect
+;; overwrites the prior store's value at the same address.
+;;
+;; This implements an unimplemented TODO acknowledged by upstream
+;; cranelift (see `alias_analysis.rs:53-62`). All five safety
+;; preconditions enumerated by the upstream comment are enforced by
+;; `AliasAnalysis::find_dead_store_at` (the implementation of the
+;; `prior_dead_store_at_same_loc` extern):
+;;
+;;   - current store is plain (non-extending) notrap Store
+;;   - prior store is plain notrap Store
+;;   - matching (address, offset, ty) — must-alias
+;;   - observed bit on the mem_values entry is false (no intervening
+;;     load read the prior store's value)
+;;   - same basic block, prior comes first, no intervening can_trap inst
+(rule (simplify_skeleton inst @ (store flags_curr _ _ _))
+      (if-let true (mem_flags_notrap flags_curr))
+      (if-let prior (prior_dead_store_at_same_loc inst))
+      (remove_other prior))

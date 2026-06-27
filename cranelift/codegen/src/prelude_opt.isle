@@ -86,7 +86,17 @@
         ;; The old instruction must define a single result value and `val` must
         ;; match its type. The new instruction need not define the same number
         ;; or types of results as the old instruction.
-        (ReplaceWithVal (inst Inst) (val Value))))
+        (ReplaceWithVal (inst Inst) (val Value))
+
+        ;; Remove a DIFFERENT instruction from the skeleton, while keeping the
+        ;; instruction being simplified in place. Used by redundant-store DCE,
+        ;; where seeing a new store to a memory location lets us discover that
+        ;; a prior store to the same location is dead.
+        ;;
+        ;; The current instruction (the one being simplified) is preserved by
+        ;; the driver and will be processed normally by GVN / alias analysis
+        ;; after this variant has fired.
+        (RemoveOther (inst Inst))))
 
 (decl pure inst_to_skeleton_inst_simplification (Inst) SkeletonInstSimplification)
 (rule (inst_to_skeleton_inst_simplification inst)
@@ -112,6 +122,32 @@
 ;; Mark a node as requiring remat when used in a different block.
 (decl remat (Value) Value)
 (extern constructor remat remat)
+
+;;;;; redundant-store DCE (Phase 1C — luna v2.1 Path D) ;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; True iff `MemFlags::notrap()` — i.e., the memory access is guaranteed not to
+;; trap. This is upstream's documented precondition for dead-store elimination
+;; (see `cranelift/codegen/src/ir/memflags.rs` doc on `notrap`).
+(decl pure mem_flags_notrap (MemFlags) bool)
+(extern constructor mem_flags_notrap mem_flags_notrap)
+
+;; If the given current store has a prior store to the same memory location
+;; (same address/offset/type), in the same block, with no intervening load
+;; that may have observed the prior store's value and no intervening
+;; potentially-trapping instruction, AND that prior store has notrap MemFlags,
+;; return the prior store's `Inst`. The driver will erase the prior store from
+;; the layout.
+;;
+;; This implements the upstream-acknowledged DSE TODO documented in
+;; `cranelift/codegen/src/alias_analysis.rs:53-62`.
+(decl pure partial prior_dead_store_at_same_loc (Inst) Inst)
+(extern constructor prior_dead_store_at_same_loc prior_dead_store_at_same_loc)
+
+;; Build a `SkeletonInstSimplification::RemoveOther` carrying the prior dead
+;; store inst, so the driver knows to erase a DIFFERENT instruction than the
+;; one being simplified.
+(decl pure remove_other (Inst) SkeletonInstSimplification)
+(rule (remove_other inst) (SkeletonInstSimplification.RemoveOther inst))
 
 ;; Mark a node as subsuming whatever else it's rewritten from -- this
 ;; is definitely preferable, not just a possible option. Useful for,
