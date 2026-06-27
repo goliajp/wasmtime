@@ -1,0 +1,66 @@
+test optimize
+set opt_level=speed
+target x86_64
+
+;; luna v2.1 Path D Phase 1D — filetest for the redundant-store DCE rule
+;; landed in Phase 1C (`cranelift/codegen/src/opts/skeleton.isle:48-71`).
+;;
+;; The rule fires on the shape:
+;;   1. PRIOR  store with `notrap` MemFlags to addr@off, ty
+;;   2. ... pure / non-trapping insts, no load to the same MemoryLoc ...
+;;   3. CURRENT store with `notrap` MemFlags to addr@off, ty
+;;   (same basic block, same address & offset & type)
+;;
+;; and erases the PRIOR store. See the verdict doc:
+;; `.dev/rfcs/v2.1-path-d-phase-1c-rule-impl.md` §1 (H6 "the rule itself").
+
+;;----------------------------------------------------------------------
+;; Positive — sub-2B Phase F `move_then_mul_propagates_via_move` shape.
+;; `.dev/rfcs/v2.0-track-r-r3-3-sub2B-verdict.md` §2.4 block1.
+;;
+;; Two consecutive `notrap aligned` stores to v0+0 with only pure
+;; arithmetic between them. The first (writing iconst 999, "Op::Move")
+;; must be removed; the second (writing imul result, "Op::Mul") must
+;; survive.
+;;----------------------------------------------------------------------
+
+function %dse_move_then_mul(i64, i64) -> i64 {
+block0(v0: i64, v1: i64):
+    v2 = iconst.i64 999
+    store notrap aligned v2, v0          ;; PRIOR (dead)
+    v3 = iconst.i64 6
+    v4 = imul v1, v3
+    store notrap aligned v4, v0          ;; CURRENT (kept)
+    return v4
+}
+
+; check:  block0(v0: i64, v1: i64):
+; not:    store notrap aligned v2, v0
+; not:    iconst.i64 999
+; check:  store notrap aligned v4, v0
+; check:  return v4
+
+;;----------------------------------------------------------------------
+;; Negative — intervening must-aliased load between the two stores flips
+;; the `observed` bit on the prior store's `mem_values` entry. Phase 1C's
+;; `find_dead_store_at` rejects (precondition 5), and BOTH stores must
+;; survive. Cranelift's load-to-store forwarding will erase the load
+;; itself, but that does not undo the observed-bit flip.
+;;----------------------------------------------------------------------
+
+function %dse_blocked_by_intervening_load(i64) -> i64 {
+block0(v0: i64):
+    v1 = iconst.i64 7
+    store notrap aligned v1, v0          ;; PRIOR (kept — observed by load)
+    v2 = load.i64 notrap aligned v0      ;; forwards to v1; flips observed=true
+    v3 = iadd_imm v2, 1
+    store notrap aligned v3, v0          ;; CURRENT (kept)
+    return v3
+}
+
+;; Egraph constant-folds `iadd_imm v1 (=7), 1` into a fresh `iconst.i64 8`
+;; (v5 in the optimized output), but both stores survive.
+; check:  block0(v0: i64):
+; check:  store notrap aligned v1, v0
+; check:  store notrap aligned v5, v0
+; check:  return v5
